@@ -3,13 +3,6 @@ name: Destroy Infrastructure
 on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Environment to destroy'
-        required: true
-        default: 'production'
-        type: choice
-        options:
-        - production
       confirm_destroy:
         description: 'Type "DESTROY" to confirm'
         required: true
@@ -18,12 +11,17 @@ on:
 env:
   AWS_REGION: ap-south-1
   TERRAFORM_VERSION: 1.5.0
+  TF_WORKING_DIR: ./onlinecompiler terraform   # Set working directory for Terraform
 
 jobs:
   terraform-destroy:
     name: Terraform Destroy
     runs-on: ubuntu-latest
     if: github.event.inputs.confirm_destroy == 'DESTROY'
+    
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
     
     steps:
     - name: Checkout Repository
@@ -41,37 +39,19 @@ jobs:
       with:
         terraform_version: ${{ env.TERRAFORM_VERSION }}
 
+    - name: Verify Working Directory
+      run: |
+        pwd
+        ls -la
+        echo "Current working directory contents:"
+
     - name: Terraform Init
-      run: terraform init
+      run: terraform init -input=false
 
     - name: Terraform Plan Destroy
       id: plan-destroy
       run: terraform plan -destroy -no-color
       continue-on-error: true
-
-    - name: Display Destroy Plan
-      uses: actions/github-script@v7
-      env:
-        PLAN: "${{ steps.plan-destroy.outputs.stdout }}"
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        script: |
-          const output = `#### Terraform Destroy Plan 📖
-          
-          <details><summary>Show Destroy Plan</summary>
-          
-          \`\`\`\n
-          ${process.env.PLAN}
-          \`\`\`
-          
-          </details>`;
-          
-          await github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: output
-          })
 
     - name: Terraform Destroy
       run: terraform destroy -auto-approve
