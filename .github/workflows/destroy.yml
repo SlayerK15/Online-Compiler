@@ -122,7 +122,89 @@ jobs:
 
     - name: Terraform Destroy
       run: terraform destroy -auto-approve
+    
+    - name: Clean Up ECS Cluster
+      run: |
+        echo "Starting ECS cluster cleanup..."
+        
+        # Get cluster ARN
+        CLUSTER_ARN=$(aws ecs list-clusters | grep "online-compiler" || echo "")
+        
+        if [ ! -z "$CLUSTER_ARN" ]; then
+          CLUSTER_NAME=$(echo $CLUSTER_ARN | cut -d'/' -f2 | tr -d '",')
+          echo "Found cluster: $CLUSTER_NAME"
+          
+          # 1. List and update all services to 0 tasks
+          SERVICES=$(aws ecs list-services --cluster $CLUSTER_NAME --query 'serviceArns[]' --output text || echo "")
+          if [ ! -z "$SERVICES" ]; then
+            echo "$SERVICES" | tr '\t' '\n' | while read SERVICE_ARN; do
+              SERVICE_NAME=$(echo $SERVICE_ARN | cut -d'/' -f3)
+              echo "Updating service $SERVICE_NAME to 0 tasks"
+              aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --desired-count 0
+            done
+          fi
+          
+          # 2. Wait for tasks to drain
+          echo "Waiting for tasks to drain..."
+          sleep 30
+          
+          # 3. Delete all services
+          if [ ! -z "$SERVICES" ]; then
+            echo "$SERVICES" | tr '\t' '\n' | while read SERVICE_ARN; do
+              SERVICE_NAME=$(echo $SERVICE_ARN | cut -d'/' -f3)
+              echo "Deleting service $SERVICE_NAME"
+              aws ecs delete-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --force
+            done
+          fi
+          
+          # 4. Stop any remaining tasks
+          TASKS=$(aws ecs list-tasks --cluster $CLUSTER_NAME --query 'taskArns[]' --output text || echo "")
+          if [ ! -z "$TASKS" ]; then
+            echo "$TASKS" | tr '\t' '\n' | while read TASK_ARN; do
+              echo "Stopping task $TASK_ARN"
+              aws ecs stop-task --cluster $CLUSTER_NAME --task $TASK_ARN
+            done
+          fi
+          
+          # 5. Wait for tasks to stop
+          echo "Waiting for tasks to stop..."
+          sleep 30
+          
+          # 6. Deregister all task definitions
+          TASK_DEFINITIONS=$(aws ecs list-task-definitions --family-prefix online-compiler --query 'taskDefinitionArns[]' --output text || echo "")
+          if [ ! -z "$TASK_DEFINITIONS" ]; then
+            echo "$TASK_DEFINITIONS" | tr '\t' '\n' | while read TASK_DEF_ARN; do
+              echo "Deregistering task definition $TASK_DEF_ARN"
+              aws ecs deregister-task-definition --task-definition $TASK_DEF_ARN
+            done
+          fi
+          
+          # 7. Delete the cluster
+          echo "Deleting cluster $CLUSTER_NAME"
+          aws ecs delete-cluster --cluster $CLUSTER_NAME
+          
+          # 8. Verify cluster deletion
+          VERIFY_CLUSTER=$(aws ecs describe-clusters --clusters $CLUSTER_NAME --query 'clusters[].status' --output text 2>/dev/null || echo "")
+          if [ ! -z "$VERIFY_CLUSTER" ]; then
+            echo "Warning: Cluster deletion might not be complete. Status: $VERIFY_CLUSTER"
+          else
+            echo "Cluster successfully deleted"
+          fi
+        else
+          echo "No ECS cluster found matching 'online-compiler'"
+        fi
 
+        # 9. Clean up associated CloudWatch log groups
+        echo "Cleaning up CloudWatch log groups..."
+        LOG_GROUPS=$(aws logs describe-log-groups --log-group-name-prefix "/ecs/online-compiler" --query 'logGroups[].logGroupName' --output text || echo "")
+        if [ ! -z "$LOG_GROUPS" ]; then
+          echo "$LOG_GROUPS" | tr '\t' '\n' | while read LOG_GROUP; do
+            echo "Deleting log group $LOG_GROUP"
+            aws logs delete-log-group --log-group-name "$LOG_GROUP"
+          done
+        fi
+
+        echo "ECS cleanup completed"
     - name: Verify Destruction
       run: |
         echo "Verifying resource deletion..."
