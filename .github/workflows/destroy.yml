@@ -39,9 +39,9 @@ jobs:
       with:
         terraform_version: ${{ env.TERRAFORM_VERSION }}
 
-    - name: Clean Up ECS Services
+    - name: Clean Up ECS Resources and IAM Roles
       run: |
-        echo "Cleaning up ECS services..."
+        echo "Cleaning up ECS and IAM resources..."
         
         # Get cluster name
         CLUSTER_NAME=$(aws ecs list-clusters | grep "online-compiler" | cut -d'/' -f2 | sed 's/"//g' | sed 's/,//g')
@@ -52,45 +52,73 @@ jobs:
           # List all services
           SERVICES=$(aws ecs list-services --cluster $CLUSTER_NAME | grep "service/" | cut -d'/' -f3 | sed 's/"//g' | sed 's/,//g')
           
-          # Update services to 0 desired count
+          # Update services to 0 desired count and delete
           for SERVICE in $SERVICES; do
             echo "Updating service $SERVICE to 0 desired count"
             aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE --desired-count 0 || true
+            echo "Deleting service $SERVICE"
+            aws ecs delete-service --cluster $CLUSTER_NAME --service $SERVICE --force || true
           done
           
           # Wait for tasks to drain
           echo "Waiting for tasks to drain..."
           sleep 30
           
-          # Delete services
-          for SERVICE in $SERVICES; do
-            echo "Deleting service $SERVICE"
-            aws ecs delete-service --cluster $CLUSTER_NAME --service $SERVICE --force || true
-          done
-          
-          # List and stop all tasks
+          # Stop all tasks
           TASKS=$(aws ecs list-tasks --cluster $CLUSTER_NAME | grep "task/" | cut -d'/' -f3 | sed 's/"//g' | sed 's/,//g')
           for TASK in $TASKS; do
             echo "Stopping task $TASK"
             aws ecs stop-task --cluster $CLUSTER_NAME --task $TASK || true
           done
-        else
-          echo "No ECS cluster found"
         fi
 
-    - name: Verify Working Directory
-      run: |
-        pwd
-        ls -la
-        echo "Current working directory contents:"
+        # Clean up task definitions
+        echo "Cleaning up task definitions..."
+        TASK_DEFINITIONS=$(aws ecs list-task-definitions --family-prefix online-compiler --query 'taskDefinitionArns[]' --output text)
+        if [ ! -z "$TASK_DEFINITIONS" ]; then
+          echo "$TASK_DEFINITIONS" | tr '\t' '\n' | while read TASK_DEF; do
+            echo "Deregistering task definition: $TASK_DEF"
+            aws ecs deregister-task-definition --task-definition "$TASK_DEF" || true
+          done
+        fi
+
+        # Clean up IAM roles and policies
+        echo "Cleaning up IAM roles and policies..."
+        
+        # Clean up execution role
+        EXEC_ROLE="online-compiler-execution-role"
+        echo "Cleaning up execution role: $EXEC_ROLE"
+        
+        # Detach policies from execution role
+        ATTACHED_POLICIES=$(aws iam list-attached-role-policies --role-name $EXEC_ROLE --query 'AttachedPolicies[*].PolicyArn' --output text || echo "")
+        if [ ! -z "$ATTACHED_POLICIES" ]; then
+          echo "$ATTACHED_POLICIES" | tr '\t' '\n' | while read POLICY_ARN; do
+            echo "Detaching policy $POLICY_ARN from role $EXEC_ROLE"
+            aws iam detach-role-policy --role-name $EXEC_ROLE --policy-arn $POLICY_ARN || true
+          done
+        fi
+        
+        # Delete execution role
+        aws iam delete-role --role-name $EXEC_ROLE || true
+
+        # Clean up task role
+        TASK_ROLE="online-compiler-task-role"
+        echo "Cleaning up task role: $TASK_ROLE"
+        
+        # Delete inline policies
+        INLINE_POLICIES=$(aws iam list-role-policies --role-name $TASK_ROLE --query 'PolicyNames[]' --output text || echo "")
+        if [ ! -z "$INLINE_POLICIES" ]; then
+          echo "$INLINE_POLICIES" | tr '\t' '\n' | while read POLICY_NAME; do
+            echo "Deleting inline policy $POLICY_NAME from role $TASK_ROLE"
+            aws iam delete-role-policy --role-name $TASK_ROLE --policy-name $POLICY_NAME || true
+          done
+        fi
+        
+        # Delete task role
+        aws iam delete-role --role-name $TASK_ROLE || true
 
     - name: Terraform Init
       run: terraform init -input=false
-
-    - name: Terraform Plan Destroy
-      id: plan-destroy
-      run: terraform plan -destroy -no-color
-      continue-on-error: true
 
     - name: Terraform Destroy
       run: terraform destroy -auto-approve
@@ -99,32 +127,26 @@ jobs:
       run: |
         echo "Verifying resource deletion..."
         
-        # Check ECS Cluster
+        # Check ECS Resources
+        echo "Checking ECS resources..."
         CLUSTERS=$(aws ecs list-clusters | grep "online-compiler" || echo "")
-        if [ ! -z "$CLUSTERS" ]; then
-          echo "Warning: ECS clusters still exist"
-          echo $CLUSTERS
+        TASK_DEFS=$(aws ecs list-task-definitions --family-prefix online-compiler --query 'taskDefinitionArns[]' --output text || echo "")
+        
+        if [ ! -z "$CLUSTERS" ] || [ ! -z "$TASK_DEFS" ]; then
+          echo "Warning: Some ECS resources still exist"
+          echo "Clusters: $CLUSTERS"
+          echo "Task Definitions: $TASK_DEFS"
         fi
         
-        # Check VPC
-        VPCS=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=online-compiler*" --query 'Vpcs[*].VpcId' --output text || echo "")
-        if [ ! -z "$VPCS" ]; then
-          echo "Warning: VPCs still exist"
-          echo $VPCS
-        fi
+        # Check IAM Roles
+        echo "Checking IAM roles..."
+        EXEC_ROLE=$(aws iam get-role --role-name online-compiler-execution-role 2>/dev/null || echo "")
+        TASK_ROLE=$(aws iam get-role --role-name online-compiler-task-role 2>/dev/null || echo "")
         
-        # Check Security Groups
-        SGS=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=online-compiler*" --query 'SecurityGroups[*].GroupId' --output text || echo "")
-        if [ ! -z "$SGS" ]; then
-          echo "Warning: Security Groups still exist"
-          echo $SGS
-        fi
-        
-        # Check CloudWatch Log Groups
-        LOG_GROUPS=$(aws logs describe-log-groups --log-group-name-prefix "/ecs/online-compiler" --query 'logGroups[*].logGroupName' --output text || echo "")
-        if [ ! -z "$LOG_GROUPS" ]; then
-          echo "Warning: CloudWatch Log Groups still exist"
-          echo $LOG_GROUPS
+        if [ ! -z "$EXEC_ROLE" ] || [ ! -z "$TASK_ROLE" ]; then
+          echo "Warning: Some IAM roles still exist"
+          echo "Execution Role: $EXEC_ROLE"
+          echo "Task Role: $TASK_ROLE"
         fi
 
     - name: Force Cleanup
@@ -132,17 +154,33 @@ jobs:
       run: |
         echo "Performing force cleanup of remaining resources..."
         
-        # Force delete ECS services and cluster
-        CLUSTER_NAME=$(aws ecs list-clusters | grep "online-compiler" | cut -d'/' -f2 | sed 's/"//g' | sed 's/,//g')
-        if [ ! -z "$CLUSTER_NAME" ]; then
-          SERVICES=$(aws ecs list-services --cluster $CLUSTER_NAME | grep "service/" | cut -d'/' -f3 | sed 's/"//g' | sed 's/,//g')
-          for SERVICE in $SERVICES; do
-            aws ecs delete-service --cluster $CLUSTER_NAME --service $SERVICE --force || true
+        # Force cleanup of task definitions
+        TASK_DEFS=$(aws ecs list-task-definitions --family-prefix online-compiler --query 'taskDefinitionArns[]' --output text || echo "")
+        if [ ! -z "$TASK_DEFS" ]; then
+          echo "$TASK_DEFS" | tr '\t' '\n' | while read TASK_DEF; do
+            aws ecs deregister-task-definition --task-definition "$TASK_DEF" || true
           done
-          aws ecs delete-cluster --cluster $CLUSTER_NAME || true
         fi
         
-        # Force delete Log Groups
-        aws logs describe-log-groups --log-group-name-prefix "/ecs/online-compiler" --query 'logGroups[*].logGroupName' --output text | tr '\t' '\n' | while read LOG_GROUP; do
-          aws logs delete-log-group --log-group-name "$LOG_GROUP" || true
+        # Force cleanup of IAM roles
+        ROLES=("online-compiler-execution-role" "online-compiler-task-role")
+        for ROLE in "${ROLES[@]}"; do
+          # Detach managed policies
+          POLICIES=$(aws iam list-attached-role-policies --role-name $ROLE --query 'AttachedPolicies[*].PolicyArn' --output text 2>/dev/null || echo "")
+          if [ ! -z "$POLICIES" ]; then
+            echo "$POLICIES" | tr '\t' '\n' | while read POLICY; do
+              aws iam detach-role-policy --role-name $ROLE --policy-arn $POLICY || true
+            done
+          fi
+          
+          # Delete inline policies
+          INLINE_POLICIES=$(aws iam list-role-policies --role-name $ROLE --query 'PolicyNames[]' --output text 2>/dev/null || echo "")
+          if [ ! -z "$INLINE_POLICIES" ]; then
+            echo "$INLINE_POLICIES" | tr '\t' '\n' | while read POLICY; do
+              aws iam delete-role-policy --role-name $ROLE --policy-name $POLICY || true
+            done
+          fi
+          
+          # Delete role
+          aws iam delete-role --role-name $ROLE || true
         done
