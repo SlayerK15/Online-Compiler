@@ -167,7 +167,117 @@ jobs:
         done
 
         echo "Resource cleanup completed"
+        
+    - name: Clean Up VPC Resources
+      run: |
+        echo "Starting VPC cleanup..."
+        
+        # Find VPC by tag
+        VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=online-compiler-vpc" --query 'Vpcs[0].VpcId' --output text || echo "")
+        
+        if [ ! -z "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+          echo "Found VPC: $VPC_ID"
 
+          # 1. Delete NAT Gateways if any and wait for deletion
+          NAT_GATEWAYS=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VPC_ID" --query 'NatGateways[*].NatGatewayId' --output text || echo "")
+          if [ ! -z "$NAT_GATEWAYS" ]; then
+            echo "$NAT_GATEWAYS" | tr '\t' '\n' | while read NAT_GATEWAY; do
+              echo "Deleting NAT Gateway: $NAT_GATEWAY"
+              aws ec2 delete-nat-gateway --nat-gateway-id $NAT_GATEWAY || true
+            done
+            echo "Waiting for NAT Gateways to delete..."
+            sleep 30
+          fi
+
+          # 2. Delete Load Balancers if any
+          LBS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" --output text || echo "")
+          if [ ! -z "$LBS" ]; then
+            echo "$LBS" | tr '\t' '\n' | while read LB; do
+              echo "Deleting Load Balancer: $LB"
+              aws elbv2 delete-load-balancer --load-balancer-arn $LB || true
+            done
+            echo "Waiting for Load Balancers to delete..."
+            sleep 30
+          fi
+
+          # 3. Find and delete all Security Groups (except default)
+          echo "Cleaning up Security Groups..."
+          SEC_GROUPS=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=!default" --query 'SecurityGroups[*].GroupId' --output text || echo "")
+          if [ ! -z "$SEC_GROUPS" ]; then
+            echo "$SEC_GROUPS" | tr '\t' '\n' | while read SEC_GROUP; do
+              echo "Deleting Security Group: $SEC_GROUP"
+              aws ec2 delete-security-group --group-id $SEC_GROUP || true
+            done
+          fi
+
+          # 4. Detach and delete Internet Gateway
+          IGW=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query 'InternetGateways[0].InternetGatewayId' --output text || echo "")
+          if [ ! -z "$IGW" ] && [ "$IGW" != "None" ]; then
+            echo "Detaching Internet Gateway: $IGW"
+            aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID || true
+            echo "Deleting Internet Gateway: $IGW"
+            aws ec2 delete-internet-gateway --internet-gateway-id $IGW || true
+          fi
+
+          # 5. Delete Subnets
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[*].SubnetId' --output text || echo "")
+          if [ ! -z "$SUBNETS" ]; then
+            echo "$SUBNETS" | tr '\t' '\n' | while read SUBNET; do
+              echo "Deleting Subnet: $SUBNET"
+              aws ec2 delete-subnet --subnet-id $SUBNET || true
+            done
+          fi
+
+          # 6. Delete Route Tables (except main)
+          ROUTE_TABLES=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query 'RouteTables[?Associations[0].Main != `true`].RouteTableId' --output text || echo "")
+          if [ ! -z "$ROUTE_TABLES" ]; then
+            echo "$ROUTE_TABLES" | tr '\t' '\n' | while read RT; do
+              # First remove route table associations
+              ASSOCIATIONS=$(aws ec2 describe-route-tables --route-table-id $RT --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text || echo "")
+              if [ ! -z "$ASSOCIATIONS" ]; then
+                echo "$ASSOCIATIONS" | tr '\t' '\n' | while read ASSOC; do
+                  echo "Deleting Route Table Association: $ASSOC"
+                  aws ec2 disassociate-route-table --association-id $ASSOC || true
+                done
+              fi
+              echo "Deleting Route Table: $RT"
+              aws ec2 delete-route-table --route-table-id $RT || true
+            done
+          fi
+
+          # 7. Delete VPC Endpoints if any
+          VPC_ENDPOINTS=$(aws ec2 describe-vpc-endpoints --filters "Name=vpc-id,Values=$VPC_ID" --query 'VpcEndpoints[*].VpcEndpointId' --output text || echo "")
+          if [ ! -z "$VPC_ENDPOINTS" ]; then
+            echo "Deleting VPC Endpoints..."
+            aws ec2 delete-vpc-endpoints --vpc-endpoint-ids $VPC_ENDPOINTS || true
+          fi
+
+          # 8. Delete Network ACLs (except default)
+          NACLS=$(aws ec2 describe-network-acls --filters "Name=vpc-id,Values=$VPC_ID" "Name=default,Values=false" --query 'NetworkAcls[*].NetworkAclId' --output text || echo "")
+          if [ ! -z "$NACLS" ]; then
+            echo "$NACLS" | tr '\t' '\n' | while read NACL; do
+              echo "Deleting Network ACL: $NACL"
+              aws ec2 delete-network-acl --network-acl-id $NACL || true
+            done
+          fi
+
+          # 9. Finally, attempt to delete the VPC
+          echo "Deleting VPC: $VPC_ID"
+          aws ec2 delete-vpc --vpc-id $VPC_ID || true
+        else
+          echo "No VPC found with tag Name:online-compiler-vpc"
+        fi
+
+        # Verify VPC deletion
+        sleep 10
+        VPC_CHECK=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=online-compiler-vpc" --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
+        if [ ! -z "$VPC_CHECK" ] && [ "$VPC_CHECK" != "None" ]; then
+          echo "Warning: VPC might still exist: $VPC_CHECK"
+        else
+          echo "VPC deletion verified"
+        fi
+
+        echo "VPC cleanup completed"
     - name: Terraform Plan Destroy
       id: plan
       run: |
