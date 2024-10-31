@@ -1,178 +1,246 @@
-name: Destroy Infrastructure
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
 
-on:
-  workflow_dispatch:
-    inputs:
-      confirm_destroy:
-        description: 'Type "DESTROY" to confirm'
-        required: true
-        type: string
+provider "aws" {
+  region = "ap-south-1"
+}
 
-env:
-  AWS_REGION: ap-south-1
-  TERRAFORM_VERSION: 1.5.0
-  TF_WORKING_DIR: ./onlinecompiler terraform
+# VPC
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
 
-jobs:
-  terraform-destroy:
-    name: Terraform Destroy
-    runs-on: ubuntu-latest
-    if: github.event.inputs.confirm_destroy == 'DESTROY'
-    
-    defaults:
-      run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
-    
-    steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+  tags = {
+    Name = "online-compiler-vpc"
+  }
+}
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+# Internet Gateway
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TERRAFORM_VERSION }}
+  tags = {
+    Name = "online-compiler-igw"
+  }
+}
 
-    - name: Verify Working Directory
-      run: |
-        pwd
-        ls -la
-        echo "Current working directory contents:"
+# Public Subnets
+resource "aws_subnet" "public" {
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.${count.index + 1}.0/24"
+  availability_zone = "ap-south-1${count.index == 0 ? "a" : "b"}"
 
-    - name: Terraform Init
-      id: init
-      run: terraform init -input=false
+  map_public_ip_on_launch = true
 
-    - name: Comprehensive Resource Cleanup
-      run: |
-        echo "Starting comprehensive resource cleanup..."
-        
-        # Get cluster information
-        CLUSTER_ARN=$(aws ecs list-clusters | grep "online-compiler" || echo "")
-        
-        if [ ! -z "$CLUSTER_ARN" ]; then
-          CLUSTER_NAME=$(echo $CLUSTER_ARN | cut -d'/' -f2 | tr -d '",')
-          echo "Found cluster: $CLUSTER_NAME"
-          
-          # 1. Update and delete services
-          echo "Cleaning up ECS services..."
-          SERVICES=$(aws ecs list-services --cluster $CLUSTER_NAME --query 'serviceArns[]' --output text || echo "")
-          if [ ! -z "$SERVICES" ]; then
-            echo "$SERVICES" | tr '\t' '\n' | while read SERVICE_ARN; do
-              SERVICE_NAME=$(echo $SERVICE_ARN | cut -d'/' -f3)
-              echo "Updating service $SERVICE_NAME to 0 tasks"
-              aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --desired-count 0 || true
-            done
-            
-            # Wait for tasks to drain
-            echo "Waiting for tasks to drain..."
-            sleep 30
-            
-            # Delete services
-            echo "$SERVICES" | tr '\t' '\n' | while read SERVICE_ARN; do
-              SERVICE_NAME=$(echo $SERVICE_ARN | cut -d'/' -f3)
-              echo "Deleting service $SERVICE_NAME"
-              aws ecs delete-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --force || true
-            done
-          fi
-          
-          # 2. Stop all tasks
-          echo "Stopping all tasks..."
-          TASKS=$(aws ecs list-tasks --cluster $CLUSTER_NAME --query 'taskArns[]' --output text || echo "")
-          if [ ! -z "$TASKS" ]; then
-            echo "$TASKS" | tr '\t' '\n' | while read TASK_ARN; do
-              echo "Stopping task $TASK_ARN"
-              aws ecs stop-task --cluster $CLUSTER_NAME --task $TASK_ARN || true
-            done
-          fi
-          
-          # Wait for tasks to stop
-          echo "Waiting for tasks to stop..."
-          sleep 30
-          
-          # 3. Deregister task definitions
-          echo "Cleaning up task definitions..."
-          TASK_DEFINITIONS=$(aws ecs list-task-definitions --family-prefix online-compiler --query 'taskDefinitionArns[]' --output text || echo "")
-          if [ ! -z "$TASK_DEFINITIONS" ]; then
-            echo "$TASK_DEFINITIONS" | tr '\t' '\n' | while read TASK_DEF_ARN; do
-              echo "Deregistering task definition $TASK_DEF_ARN"
-              aws ecs deregister-task-definition --task-definition $TASK_DEF_ARN || true
-            done
-          fi
-          
-          # 4. Delete the cluster
-          echo "Deleting cluster $CLUSTER_NAME"
-          aws ecs delete-cluster --cluster $CLUSTER_NAME || true
-        else
-          echo "No ECS cluster found matching 'online-compiler'"
-        fi
+  tags = {
+    Name = "online-compiler-public-${count.index + 1}"
+  }
+}
 
-        # 5. Clean up IAM roles and policies
-        echo "Cleaning up IAM roles and policies..."
-        
-        # Clean up execution role
-        EXEC_ROLE="online-compiler-execution-role"
-        echo "Cleaning up execution role: $EXEC_ROLE"
-        ATTACHED_POLICIES=$(aws iam list-attached-role-policies --role-name $EXEC_ROLE --query 'AttachedPolicies[*].PolicyArn' --output text 2>/dev/null || echo "")
-        if [ ! -z "$ATTACHED_POLICIES" ]; then
-          echo "$ATTACHED_POLICIES" | tr '\t' '\n' | while read POLICY_ARN; do
-            echo "Detaching policy $POLICY_ARN from role $EXEC_ROLE"
-            aws iam detach-role-policy --role-name $EXEC_ROLE --policy-arn $POLICY_ARN || true
-          done
-        fi
-        aws iam delete-role --role-name $EXEC_ROLE || true
+# Route Table
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
 
-        # Clean up task role
-        TASK_ROLE="online-compiler-task-role"
-        echo "Cleaning up task role: $TASK_ROLE"
-        INLINE_POLICIES=$(aws iam list-role-policies --role-name $TASK_ROLE --query 'PolicyNames[]' --output text 2>/dev/null || echo "")
-        if [ ! -z "$INLINE_POLICIES" ]; then
-          echo "$INLINE_POLICIES" | tr '\t' '\n' | while read POLICY_NAME; do
-            echo "Deleting inline policy $POLICY_NAME from role $TASK_ROLE"
-            aws iam delete-role-policy --role-name $TASK_ROLE --policy-name $POLICY_NAME || true
-          done
-        fi
-        aws iam delete-role --role-name $TASK_ROLE || true
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
 
-        # 6. Clean up CloudWatch log groups
-        echo "Cleaning up CloudWatch log groups..."
-        LOG_GROUPS=$(aws logs describe-log-groups --log-group-name-prefix "/ecs/online-compiler" --query 'logGroups[].logGroupName' --output text || echo "")
-        if [ ! -z "$LOG_GROUPS" ]; then
-          echo "$LOG_GROUPS" | tr '\t' '\n' | while read LOG_GROUP; do
-            echo "Deleting log group $LOG_GROUP"
-            aws logs delete-log-group --log-group-name "$LOG_GROUP" || true
-          done
-        fi
+  tags = {
+    Name = "online-compiler-rt"
+  }
+}
 
-        # 7. Verify all resources are cleaned up
-        echo "Verifying cleanup..."
-        
-        # Verify cluster
-        VERIFY_CLUSTER=$(aws ecs describe-clusters --clusters $CLUSTER_NAME --query 'clusters[].status' --output text 2>/dev/null || echo "")
-        if [ ! -z "$VERIFY_CLUSTER" ]; then
-          echo "Warning: Cluster might still exist. Status: $VERIFY_CLUSTER"
-        fi
-        
-        # Verify IAM roles
-        for ROLE in "$EXEC_ROLE" "$TASK_ROLE"; do
-          if aws iam get-role --role-name $ROLE 2>/dev/null; then
-            echo "Warning: Role $ROLE might still exist"
-          fi
-        done
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
 
-        echo "Resource cleanup completed"
+# Security Group
+resource "aws_security_group" "ecs_tasks" {
+  name        = "online-compiler-tasks-sg"
+  description = "Allow inbound traffic for ECS tasks"
+  vpc_id      = aws_vpc.main.id
 
-    - name: Terraform Plan Destroy
-      id: plan
-      run: |
-        terraform plan -destroy -no-color
-      continue-on-error: true
+  ingress {
+    description = "Allow inbound HTTP"
+    from_port   = 8000
+    to_port     = 8000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
-    - name: Terraform Destroy
-      run: terraform destroy -auto-approve
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "online-compiler-tasks-sg"
+  }
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "ecs" {
+  name              = "/ecs/online-compiler"
+  retention_in_days = 30
+}
+
+# IAM Roles
+resource "aws_iam_role" "ecs_execution_role" {
+  name = "online-compiler-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
+  role       = aws_iam_role.ecs_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role" "ecs_task_role" {
+  name = "online-compiler-task-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "ecs_task_role_policy" {
+  name = "online-compiler-task-policy"
+  role = aws_iam_role.ecs_task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "main" {
+  name = "online-compiler-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+}
+
+# ECS Task Definition
+resource "aws_ecs_task_definition" "app" {
+  family                   = "online-compiler"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                     = 256
+  memory                  = 512
+  execution_role_arn      = aws_iam_role.ecs_execution_role.arn
+  task_role_arn           = aws_iam_role.ecs_task_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name         = "online-compiler"
+      image        = "slayerop15/online-compiler:latest"
+      essential    = true
+
+      portMappings = [
+        {
+          containerPort = 8000
+          hostPort      = 8000
+          protocol      = "tcp"
+        }
+      ]
+
+      environment = [
+        {
+          name  = "DJANGO_ALLOWED_HOSTS"
+          value = "*"
+        },
+        {
+          name  = "DEBUG"
+          value = "0"
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.ecs.name
+          awslogs-region        = "ap-south-1"
+          awslogs-stream-prefix = "ecs"
+        }
+      }
+    }
+  ])
+}
+
+# ECS Service
+resource "aws_ecs_service" "app" {
+  name            = "online-compiler-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = true
+  }
+}
+
+# Outputs
+output "public_subnet_ids" {
+  value = aws_subnet.public[*].id
+}
+
+output "security_group_id" {
+  value = aws_security_group.ecs_tasks.id
+}
+
+output "cluster_name" {
+  value = aws_ecs_cluster.main.name
+}
+
+output "task_definition_family" {
+  value = aws_ecs_task_definition.app.family
+}
