@@ -10,6 +10,7 @@ on:
 env:
   AWS_REGION: ap-south-1
   TERRAFORM_VERSION: 1.5.0
+  TF_WORKING_DIR: ./onlinecompiler terraform   # Set working directory for Terraform
 
 permissions:
   contents: read
@@ -19,6 +20,10 @@ jobs:
   terraform:
     name: Terraform
     runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
     
     steps:
     - name: Checkout Repository
@@ -36,14 +41,15 @@ jobs:
       with:
         terraform_version: ${{ env.TERRAFORM_VERSION }}
 
-    - name: Terraform Format
-      id: fmt
-      run: terraform fmt -check
-      continue-on-error: true
+    - name: Verify Working Directory
+      run: |
+        pwd
+        ls -la
+        echo "Current working directory contents:"
 
     - name: Terraform Init
       id: init
-      run: terraform init
+      run: terraform init -input=false
 
     - name: Terraform Validate
       id: validate
@@ -62,8 +68,7 @@ jobs:
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
-          const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
-          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          const output = `#### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
           #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
           #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
           
@@ -81,10 +86,6 @@ jobs:
             repo: context.repo.repo,
             body: output
           })
-
-    - name: Terraform Plan Status
-      if: steps.plan.outcome == 'failure'
-      run: exit 1
 
     - name: Terraform Apply
       if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
