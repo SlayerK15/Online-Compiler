@@ -39,6 +39,16 @@ jobs:
       with:
         terraform_version: ${{ env.TERRAFORM_VERSION }}
 
+    - name: Verify Working Directory
+      run: |
+        pwd
+        ls -la
+        echo "Current working directory contents:"
+
+    - name: Terraform Init
+      id: init
+      run: terraform init -input=false
+
     - name: Comprehensive Resource Cleanup
       run: |
         echo "Starting comprehensive resource cleanup..."
@@ -158,69 +168,11 @@ jobs:
 
         echo "Resource cleanup completed"
 
-    - name: Terraform Init
-      run: terraform init -input=false
+    - name: Terraform Plan Destroy
+      id: plan
+      run: |
+        terraform plan -destroy -no-color
+      continue-on-error: true
 
     - name: Terraform Destroy
       run: terraform destroy -auto-approve
-    - name: Verify Destruction
-      run: |
-        echo "Verifying resource deletion..."
-        
-        # Check ECS Resources
-        echo "Checking ECS resources..."
-        CLUSTERS=$(aws ecs list-clusters | grep "online-compiler" || echo "")
-        TASK_DEFS=$(aws ecs list-task-definitions --family-prefix online-compiler --query 'taskDefinitionArns[]' --output text || echo "")
-        
-        if [ ! -z "$CLUSTERS" ] || [ ! -z "$TASK_DEFS" ]; then
-          echo "Warning: Some ECS resources still exist"
-          echo "Clusters: $CLUSTERS"
-          echo "Task Definitions: $TASK_DEFS"
-        fi
-        
-        # Check IAM Roles
-        echo "Checking IAM roles..."
-        EXEC_ROLE=$(aws iam get-role --role-name online-compiler-execution-role 2>/dev/null || echo "")
-        TASK_ROLE=$(aws iam get-role --role-name online-compiler-task-role 2>/dev/null || echo "")
-        
-        if [ ! -z "$EXEC_ROLE" ] || [ ! -z "$TASK_ROLE" ]; then
-          echo "Warning: Some IAM roles still exist"
-          echo "Execution Role: $EXEC_ROLE"
-          echo "Task Role: $TASK_ROLE"
-        fi
-
-    - name: Force Cleanup
-      if: always()
-      run: |
-        echo "Performing force cleanup of remaining resources..."
-        
-        # Force cleanup of task definitions
-        TASK_DEFS=$(aws ecs list-task-definitions --family-prefix online-compiler --query 'taskDefinitionArns[]' --output text || echo "")
-        if [ ! -z "$TASK_DEFS" ]; then
-          echo "$TASK_DEFS" | tr '\t' '\n' | while read TASK_DEF; do
-            aws ecs deregister-task-definition --task-definition "$TASK_DEF" || true
-          done
-        fi
-        
-        # Force cleanup of IAM roles
-        ROLES=("online-compiler-execution-role" "online-compiler-task-role")
-        for ROLE in "${ROLES[@]}"; do
-          # Detach managed policies
-          POLICIES=$(aws iam list-attached-role-policies --role-name $ROLE --query 'AttachedPolicies[*].PolicyArn' --output text 2>/dev/null || echo "")
-          if [ ! -z "$POLICIES" ]; then
-            echo "$POLICIES" | tr '\t' '\n' | while read POLICY; do
-              aws iam detach-role-policy --role-name $ROLE --policy-arn $POLICY || true
-            done
-          fi
-          
-          # Delete inline policies
-          INLINE_POLICIES=$(aws iam list-role-policies --role-name $ROLE --query 'PolicyNames[]' --output text 2>/dev/null || echo "")
-          if [ ! -z "$INLINE_POLICIES" ]; then
-            echo "$INLINE_POLICIES" | tr '\t' '\n' | while read POLICY; do
-              aws iam delete-role-policy --role-name $ROLE --policy-name $POLICY || true
-            done
-          fi
-          
-          # Delete role
-          aws iam delete-role --role-name $ROLE || true
-        done
