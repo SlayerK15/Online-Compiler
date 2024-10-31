@@ -11,7 +11,7 @@ on:
 env:
   AWS_REGION: ap-south-1
   TERRAFORM_VERSION: 1.5.0
-  TF_WORKING_DIR: ./onlinecompiler terraform   # Set working directory for Terraform
+  TF_WORKING_DIR: ./onlinecompiler terraform
 
 jobs:
   terraform-destroy:
@@ -39,6 +39,45 @@ jobs:
       with:
         terraform_version: ${{ env.TERRAFORM_VERSION }}
 
+    - name: Clean Up ECS Services
+      run: |
+        echo "Cleaning up ECS services..."
+        
+        # Get cluster name
+        CLUSTER_NAME=$(aws ecs list-clusters | grep "online-compiler" | cut -d'/' -f2 | sed 's/"//g' | sed 's/,//g')
+        
+        if [ ! -z "$CLUSTER_NAME" ]; then
+          echo "Found cluster: $CLUSTER_NAME"
+          
+          # List all services
+          SERVICES=$(aws ecs list-services --cluster $CLUSTER_NAME | grep "service/" | cut -d'/' -f3 | sed 's/"//g' | sed 's/,//g')
+          
+          # Update services to 0 desired count
+          for SERVICE in $SERVICES; do
+            echo "Updating service $SERVICE to 0 desired count"
+            aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE --desired-count 0 || true
+          done
+          
+          # Wait for tasks to drain
+          echo "Waiting for tasks to drain..."
+          sleep 30
+          
+          # Delete services
+          for SERVICE in $SERVICES; do
+            echo "Deleting service $SERVICE"
+            aws ecs delete-service --cluster $CLUSTER_NAME --service $SERVICE --force || true
+          done
+          
+          # List and stop all tasks
+          TASKS=$(aws ecs list-tasks --cluster $CLUSTER_NAME | grep "task/" | cut -d'/' -f3 | sed 's/"//g' | sed 's/,//g')
+          for TASK in $TASKS; do
+            echo "Stopping task $TASK"
+            aws ecs stop-task --cluster $CLUSTER_NAME --task $TASK || true
+          done
+        else
+          echo "No ECS cluster found"
+        fi
+
     - name: Verify Working Directory
       run: |
         pwd
@@ -55,3 +94,55 @@ jobs:
 
     - name: Terraform Destroy
       run: terraform destroy -auto-approve
+
+    - name: Verify Destruction
+      run: |
+        echo "Verifying resource deletion..."
+        
+        # Check ECS Cluster
+        CLUSTERS=$(aws ecs list-clusters | grep "online-compiler" || echo "")
+        if [ ! -z "$CLUSTERS" ]; then
+          echo "Warning: ECS clusters still exist"
+          echo $CLUSTERS
+        fi
+        
+        # Check VPC
+        VPCS=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=online-compiler*" --query 'Vpcs[*].VpcId' --output text || echo "")
+        if [ ! -z "$VPCS" ]; then
+          echo "Warning: VPCs still exist"
+          echo $VPCS
+        fi
+        
+        # Check Security Groups
+        SGS=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=online-compiler*" --query 'SecurityGroups[*].GroupId' --output text || echo "")
+        if [ ! -z "$SGS" ]; then
+          echo "Warning: Security Groups still exist"
+          echo $SGS
+        fi
+        
+        # Check CloudWatch Log Groups
+        LOG_GROUPS=$(aws logs describe-log-groups --log-group-name-prefix "/ecs/online-compiler" --query 'logGroups[*].logGroupName' --output text || echo "")
+        if [ ! -z "$LOG_GROUPS" ]; then
+          echo "Warning: CloudWatch Log Groups still exist"
+          echo $LOG_GROUPS
+        fi
+
+    - name: Force Cleanup
+      if: always()
+      run: |
+        echo "Performing force cleanup of remaining resources..."
+        
+        # Force delete ECS services and cluster
+        CLUSTER_NAME=$(aws ecs list-clusters | grep "online-compiler" | cut -d'/' -f2 | sed 's/"//g' | sed 's/,//g')
+        if [ ! -z "$CLUSTER_NAME" ]; then
+          SERVICES=$(aws ecs list-services --cluster $CLUSTER_NAME | grep "service/" | cut -d'/' -f3 | sed 's/"//g' | sed 's/,//g')
+          for SERVICE in $SERVICES; do
+            aws ecs delete-service --cluster $CLUSTER_NAME --service $SERVICE --force || true
+          done
+          aws ecs delete-cluster --cluster $CLUSTER_NAME || true
+        fi
+        
+        # Force delete Log Groups
+        aws logs describe-log-groups --log-group-name-prefix "/ecs/online-compiler" --query 'logGroups[*].logGroupName' --output text | tr '\t' '\n' | while read LOG_GROUP; do
+          aws logs delete-log-group --log-group-name "$LOG_GROUP" || true
+        done
